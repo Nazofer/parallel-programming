@@ -214,7 +214,7 @@ func countWordsParallel(files []string, workers int) (wordsStats, error) {
 		Err   error
 	}
 
-	paths := make(chan string)
+	paths := make(chan string, len(files))
 	results := make(chan result, len(files))
 
 	for i := 0; i < workers; i++ {
