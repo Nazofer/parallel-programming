@@ -16,12 +16,6 @@ type statsConfig struct {
 	Threshold int
 }
 
-type aggregateStats struct {
-	Min int64
-	Max int64
-	Sum int64
-}
-
 type numberStats struct {
 	Min    int64
 	Max    int64
@@ -91,36 +85,65 @@ func buildNumbers(count int, seed int64) []int64 {
 	return numbers
 }
 
+// --- Sequential ---
+
 func calculateNumberStats(numbers []int64) numberStats {
-	aggregate := aggregateSequential(numbers)
-	return buildNumberStats(numbers, aggregate)
+	sorted := sortedCopy(numbers)
+	return buildNumberStatsFromSorted(sorted)
 }
+
+// --- MapReduce ---
 
 func calculateNumberStatsMapReduce(numbers []int64, workers int) numberStats {
 	ranges := splitIntRange(0, len(numbers)-1, workers)
-	results := make(chan aggregateStats, len(ranges))
+	results := make(chan []int64, len(ranges))
 	for _, part := range ranges {
 		go func(start, end int) {
-			results <- aggregateSequential(numbers[start : end+1])
+			chunk := sortedCopy(numbers[start : end+1])
+			results <- chunk
 		}(part[0], part[1])
 	}
 
-	aggregate := aggregateStats{}
-	for idx := range ranges {
-		part := <-results
-		if idx == 0 {
-			aggregate = part
-			continue
-		}
-		aggregate = mergeAggregateStats(aggregate, part)
+	sorted := <-results
+	for i := 1; i < len(ranges); i++ {
+		chunk := <-results
+		sorted = mergeSorted(sorted, chunk)
 	}
-	return buildNumberStats(numbers, aggregate)
+	return buildNumberStatsFromSorted(sorted)
 }
 
+// --- ForkJoin ---
+
 func calculateNumberStatsForkJoin(numbers []int64, workers, threshold int) numberStats {
-	aggregate := aggregateForkJoin(numbers, maxInt(workers, 1), threshold)
-	return buildNumberStats(numbers, aggregate)
+	sorted := sortForkJoin(numbers, maxInt(workers, 1), threshold)
+	return buildNumberStatsFromSorted(sorted)
 }
+
+func sortForkJoin(numbers []int64, workers, threshold int) []int64 {
+	if len(numbers) <= threshold || workers <= 1 {
+		return sortedCopy(numbers)
+	}
+
+	mid := len(numbers) / 2
+	leftWorkers := workers / 2
+	if leftWorkers == 0 {
+		leftWorkers = 1
+	}
+	rightWorkers := workers - leftWorkers
+	if rightWorkers == 0 {
+		rightWorkers = 1
+	}
+
+	leftCh := make(chan []int64, 1)
+	go func() {
+		leftCh <- sortForkJoin(numbers[:mid], leftWorkers, threshold)
+	}()
+	right := sortForkJoin(numbers[mid:], rightWorkers, threshold)
+	left := <-leftCh
+	return mergeSorted(left, right)
+}
+
+// --- WorkerPool ---
 
 func calculateNumberStatsWorkerPool(numbers []int64, workers int) numberStats {
 	type job struct {
@@ -129,7 +152,7 @@ func calculateNumberStatsWorkerPool(numbers []int64, workers int) numberStats {
 	}
 
 	jobs := make(chan job)
-	results := make(chan aggregateStats, workers)
+	results := make(chan []int64, workers)
 	chunkSize := (len(numbers) + workers - 1) / workers
 	if chunkSize <= 0 {
 		chunkSize = len(numbers)
@@ -137,8 +160,8 @@ func calculateNumberStatsWorkerPool(numbers []int64, workers int) numberStats {
 
 	for i := 0; i < workers; i++ {
 		go func() {
-			for job := range jobs {
-				results <- aggregateSequential(numbers[job.Start:job.End])
+			for j := range jobs {
+				results <- sortedCopy(numbers[j.Start:j.End])
 			}
 		}()
 	}
@@ -154,82 +177,57 @@ func calculateNumberStatsWorkerPool(numbers []int64, workers int) numberStats {
 	}
 	close(jobs)
 
-	aggregate := aggregateStats{}
-	for idx := 0; idx < jobCount; idx++ {
-		part := <-results
-		if idx == 0 {
-			aggregate = part
-			continue
-		}
-		aggregate = mergeAggregateStats(aggregate, part)
+	sorted := <-results
+	for i := 1; i < jobCount; i++ {
+		chunk := <-results
+		sorted = mergeSorted(sorted, chunk)
 	}
-	return buildNumberStats(numbers, aggregate)
+	return buildNumberStatsFromSorted(sorted)
 }
 
-func aggregateSequential(numbers []int64) aggregateStats {
-	stats := aggregateStats{Min: numbers[0], Max: numbers[0]}
-	for _, value := range numbers {
-		if value < stats.Min {
-			stats.Min = value
-		}
-		if value > stats.Max {
-			stats.Max = value
-		}
-		stats.Sum += value
-	}
-	return stats
-}
+// --- Helpers ---
 
-func aggregateForkJoin(numbers []int64, workers, threshold int) aggregateStats {
-	if len(numbers) <= threshold || workers <= 1 {
-		return aggregateSequential(numbers)
-	}
-
-	mid := len(numbers) / 2
-	leftWorkers := workers / 2
-	if leftWorkers == 0 {
-		leftWorkers = 1
-	}
-	rightWorkers := workers - leftWorkers
-	if rightWorkers == 0 {
-		rightWorkers = 1
-	}
-
-	leftCh := make(chan aggregateStats, 1)
-	go func() {
-		leftCh <- aggregateForkJoin(numbers[:mid], leftWorkers, threshold)
-	}()
-	right := aggregateForkJoin(numbers[mid:], rightWorkers, threshold)
-	left := <-leftCh
-	return mergeAggregateStats(left, right)
-}
-
-func mergeAggregateStats(left, right aggregateStats) aggregateStats {
-	if right.Min < left.Min {
-		left.Min = right.Min
-	}
-	if right.Max > left.Max {
-		left.Max = right.Max
-	}
-	left.Sum += right.Sum
-	return left
-}
-
-func buildNumberStats(numbers []int64, aggregate aggregateStats) numberStats {
-	return numberStats{
-		Min:    aggregate.Min,
-		Max:    aggregate.Max,
-		Median: calculateMedian(numbers),
-		Mean:   float64(aggregate.Sum) / float64(len(numbers)),
-	}
-}
-
-func calculateMedian(numbers []int64) float64 {
+func sortedCopy(numbers []int64) []int64 {
 	cloned := append([]int64(nil), numbers...)
 	sort.Slice(cloned, func(i, j int) bool { return cloned[i] < cloned[j] })
-	mid := len(cloned) / 2
-	if len(cloned)%2 == 1 {
-		return float64(cloned[mid])
+	return cloned
+}
+
+func mergeSorted(a, b []int64) []int64 {
+	result := make([]int64, len(a)+len(b))
+	i, j, k := 0, 0, 0
+	for i < len(a) && j < len(b) {
+		if a[i] <= b[j] {
+			result[k] = a[i]
+			i++
+		} else {
+			result[k] = b[j]
+			j++
+		}
+		k++
 	}
-	return float64(cloned[mid-1]+cloned[mid]) / 2
+	copy(result[k:], a[i:])
+	copy(result[k+len(a)-i:], b[j:])
+	return result
+}
+
+func buildNumberStatsFromSorted(sorted []int64) numberStats {
+	n := len(sorted)
+	var sum int64
+	for _, v := range sorted {
+		sum += v
+	}
+	mid := n / 2
+	var median float64
+	if n%2 == 1 {
+		median = float64(sorted[mid])
+	} else {
+		median = float64(sorted[mid-1]+sorted[mid]) / 2
+	}
+	return numberStats{
+		Min:    sorted[0],
+		Max:    sorted[n-1],
+		Median: median,
+		Mean:   float64(sum) / float64(n),
+	}
 }
