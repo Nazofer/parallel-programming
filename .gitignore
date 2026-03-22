@@ -1,2 +1,5 @@
 *.cache/
 *tmp/
+
+# Ignore build files
+lab*/lab*
