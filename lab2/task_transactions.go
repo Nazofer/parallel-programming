@@ -14,9 +14,12 @@ import (
 	"time"
 )
 
+const defaultBatchSize = 512
+
 type transactionsConfig struct {
 	Input            string
 	Buffer           int
+	BatchSize        int
 	ReadWorkers      int
 	TransformWorkers int
 }
@@ -65,7 +68,8 @@ func parseTransactionsFlags(args []string, stderr io.Writer) (transactionsConfig
 	fs := newFlagSet("transactions", stderr)
 	cfg := transactionsConfig{}
 	fs.StringVar(&cfg.Input, "input", "./tmp/transactions-dataset/transactions.csv", "path to transactions csv")
-	fs.IntVar(&cfg.Buffer, "buffer", 0, "channel buffer size")
+	fs.IntVar(&cfg.Buffer, "buffer", 0, "channel buffer size (in batches)")
+	fs.IntVar(&cfg.BatchSize, "batch", 0, "records per batch")
 	fs.IntVar(&cfg.ReadWorkers, "read-workers", 0, "number of workers in parse stage pipeline")
 	fs.IntVar(&cfg.TransformWorkers, "transform-workers", 0, "number of workers in transform stages pipeline")
 	if err := fs.Parse(args); err != nil {
@@ -76,6 +80,9 @@ func parseTransactionsFlags(args []string, stderr io.Writer) (transactionsConfig
 	}
 	if cfg.Buffer < 0 {
 		return transactionsConfig{}, fmt.Errorf("buffer must be >= 0")
+	}
+	if cfg.BatchSize < 0 {
+		return transactionsConfig{}, fmt.Errorf("batch must be >= 0")
 	}
 	if cfg.ReadWorkers < 0 {
 		return transactionsConfig{}, fmt.Errorf("read-workers must be >= 0")
@@ -132,6 +139,7 @@ func runTransactionsTask(cfg transactionsConfig, variant executionVariant, worke
 		Params: map[string]string{
 			"input":             cfg.Input,
 			"buffer":            strconv.Itoa(cfg.Buffer),
+			"batch":             strconv.Itoa(cfg.BatchSize),
 			"read_workers":      strconv.Itoa(cfg.ReadWorkers),
 			"transform_workers": strconv.Itoa(cfg.TransformWorkers),
 		},
@@ -156,6 +164,9 @@ func normalizeTransactionsConfig(cfg transactionsConfig, workers int) transactio
 	}
 	if cfg.Buffer == 0 {
 		cfg.Buffer = maxInt(8, workers*4)
+	}
+	if cfg.BatchSize == 0 {
+		cfg.BatchSize = defaultBatchSize
 	}
 	return cfg
 }
@@ -209,6 +220,8 @@ func generateTransactionsDataset(cfg transactionsDatasetConfig) (transactionsDat
 	return transactionsDatasetStats{Files: 1, Records: cfg.Records}, nil
 }
 
+// --- Sequential ---
+
 func processTransactionsSequential(path string) (transactionStats, error) {
 	reader, file, err := openTransactionsReader(path)
 	if err != nil {
@@ -233,18 +246,21 @@ func processTransactionsSequential(path string) (transactionStats, error) {
 	}
 }
 
+// --- Pipeline (batched) ---
+
 func processTransactionsPipeline(cfg transactionsConfig) (transactionStats, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rawRows := make(chan []string, cfg.Buffer)
-	parsed := make(chan Transaction, cfg.Buffer)
-	converted := make(chan convertedTransaction, cfg.Buffer)
-	processed := make(chan processedTransaction, cfg.Buffer)
+	rawBatches := make(chan [][]string, cfg.Buffer)
+	parsedBatches := make(chan []Transaction, cfg.Buffer)
+	convertedBatches := make(chan []convertedTransaction, cfg.Buffer)
+	processedBatches := make(chan []processedTransaction, cfg.Buffer)
 	errCh := make(chan error, 1)
 
+	// Stage 1: read CSV into batches of raw rows
 	go func() {
-		defer close(rawRows)
+		defer close(rawBatches)
 		reader, file, err := openTransactionsReader(cfg.Input)
 		if err != nil {
 			sendPipelineError(errCh, cancel, err)
@@ -252,23 +268,36 @@ func processTransactionsPipeline(cfg transactionsConfig) (transactionStats, erro
 		}
 		defer file.Close()
 
+		batch := make([][]string, 0, cfg.BatchSize)
 		for {
 			record, err := reader.Read()
 			if err == io.EOF {
+				if len(batch) > 0 {
+					select {
+					case <-ctx.Done():
+						return
+					case rawBatches <- batch:
+					}
+				}
 				return
 			}
 			if err != nil {
 				sendPipelineError(errCh, cancel, err)
 				return
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case rawRows <- record:
+			batch = append(batch, record)
+			if len(batch) >= cfg.BatchSize {
+				select {
+				case <-ctx.Done():
+					return
+				case rawBatches <- batch:
+				}
+				batch = make([][]string, 0, cfg.BatchSize)
 			}
 		}
 	}()
 
+	// Stage 2: parse raw rows into Transaction structs
 	var parseWG sync.WaitGroup
 	parseWG.Add(cfg.ReadWorkers)
 	for i := 0; i < cfg.ReadWorkers; i++ {
@@ -278,19 +307,23 @@ func processTransactionsPipeline(cfg transactionsConfig) (transactionStats, erro
 				select {
 				case <-ctx.Done():
 					return
-				case record, ok := <-rawRows:
+				case batch, ok := <-rawBatches:
 					if !ok {
 						return
 					}
-					tx, err := parseTransactionRecord(record)
-					if err != nil {
-						sendPipelineError(errCh, cancel, err)
-						return
+					parsed := make([]Transaction, 0, len(batch))
+					for _, record := range batch {
+						tx, err := parseTransactionRecord(record)
+						if err != nil {
+							sendPipelineError(errCh, cancel, err)
+							return
+						}
+						parsed = append(parsed, tx)
 					}
 					select {
 					case <-ctx.Done():
 						return
-					case parsed <- tx:
+					case parsedBatches <- parsed:
 					}
 				}
 			}
@@ -298,9 +331,10 @@ func processTransactionsPipeline(cfg transactionsConfig) (transactionStats, erro
 	}
 	go func() {
 		parseWG.Wait()
-		close(parsed)
+		close(parsedBatches)
 	}()
 
+	// Stage 3: convert currency
 	var convertWG sync.WaitGroup
 	convertWG.Add(cfg.TransformWorkers)
 	for i := 0; i < cfg.TransformWorkers; i++ {
@@ -310,15 +344,21 @@ func processTransactionsPipeline(cfg transactionsConfig) (transactionStats, erro
 				select {
 				case <-ctx.Done():
 					return
-				case tx, ok := <-parsed:
+				case batch, ok := <-parsedBatches:
 					if !ok {
 						return
 					}
-					item := convertedTransaction{Tx: tx, GrossUAHKopeck: convertToUAHKopecks(tx.AmountCents, tx.Currency)}
+					conv := make([]convertedTransaction, 0, len(batch))
+					for _, tx := range batch {
+						conv = append(conv, convertedTransaction{
+							Tx:             tx,
+							GrossUAHKopeck: convertToUAHKopecks(tx.AmountCents, tx.Currency),
+						})
+					}
 					select {
 					case <-ctx.Done():
 						return
-					case converted <- item:
+					case convertedBatches <- conv:
 					}
 				}
 			}
@@ -326,9 +366,10 @@ func processTransactionsPipeline(cfg transactionsConfig) (transactionStats, erro
 	}
 	go func() {
 		convertWG.Wait()
-		close(converted)
+		close(convertedBatches)
 	}()
 
+	// Stage 4: apply cashback
 	var cashbackWG sync.WaitGroup
 	cashbackWG.Add(cfg.TransformWorkers)
 	for i := 0; i < cfg.TransformWorkers; i++ {
@@ -338,15 +379,18 @@ func processTransactionsPipeline(cfg transactionsConfig) (transactionStats, erro
 				select {
 				case <-ctx.Done():
 					return
-				case item, ok := <-converted:
+				case batch, ok := <-convertedBatches:
 					if !ok {
 						return
 					}
-					processedTx := applyCashback(item)
+					out := make([]processedTransaction, 0, len(batch))
+					for _, item := range batch {
+						out = append(out, applyCashback(item))
+					}
 					select {
 					case <-ctx.Done():
 						return
-					case processed <- processedTx:
+					case processedBatches <- out:
 					}
 				}
 			}
@@ -354,12 +398,15 @@ func processTransactionsPipeline(cfg transactionsConfig) (transactionStats, erro
 	}
 	go func() {
 		cashbackWG.Wait()
-		close(processed)
+		close(processedBatches)
 	}()
 
+	// Aggregator
 	stats := transactionStats{}
-	for item := range processed {
-		stats.add(item)
+	for batch := range processedBatches {
+		for _, item := range batch {
+			stats.add(item)
+		}
 	}
 	select {
 	case err := <-errCh:
@@ -369,14 +416,17 @@ func processTransactionsPipeline(cfg transactionsConfig) (transactionStats, erro
 	}
 }
 
+// --- Producer-Consumer (batched) ---
+
 func processTransactionsProducerConsumer(cfg transactionsConfig, workers int) (transactionStats, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	jobs := make(chan Transaction, cfg.Buffer)
-	results := make(chan processedTransaction, cfg.Buffer)
+	jobs := make(chan []Transaction, cfg.Buffer)
+	results := make(chan transactionStats, cfg.Buffer)
 	errCh := make(chan error, 1)
 
+	// Producer: read and parse CSV into batches
 	go func() {
 		defer close(jobs)
 		reader, file, err := openTransactionsReader(cfg.Input)
@@ -386,9 +436,17 @@ func processTransactionsProducerConsumer(cfg transactionsConfig, workers int) (t
 		}
 		defer file.Close()
 
+		batch := make([]Transaction, 0, cfg.BatchSize)
 		for {
 			record, err := reader.Read()
 			if err == io.EOF {
+				if len(batch) > 0 {
+					select {
+					case <-ctx.Done():
+						return
+					case jobs <- batch:
+					}
+				}
 				return
 			}
 			if err != nil {
@@ -400,32 +458,36 @@ func processTransactionsProducerConsumer(cfg transactionsConfig, workers int) (t
 				sendPipelineError(errCh, cancel, err)
 				return
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case jobs <- tx:
+			batch = append(batch, tx)
+			if len(batch) >= cfg.BatchSize {
+				select {
+				case <-ctx.Done():
+					return
+				case jobs <- batch:
+				}
+				batch = make([]Transaction, 0, cfg.BatchSize)
 			}
 		}
 	}()
 
+	// Consumers: process batches and compute partial stats
 	var consumerWG sync.WaitGroup
 	consumerWG.Add(workers)
 	for i := 0; i < workers; i++ {
 		go func() {
 			defer consumerWG.Done()
+			local := transactionStats{}
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case tx, ok := <-jobs:
+				case batch, ok := <-jobs:
 					if !ok {
+						results <- local
 						return
 					}
-					result := processTransaction(tx)
-					select {
-					case <-ctx.Done():
-						return
-					case results <- result:
+					for _, tx := range batch {
+						local.add(processTransaction(tx))
 					}
 				}
 			}
@@ -437,9 +499,14 @@ func processTransactionsProducerConsumer(cfg transactionsConfig, workers int) (t
 		close(results)
 	}()
 
+	// Aggregate partial stats
 	stats := transactionStats{}
-	for result := range results {
-		stats.add(result)
+	for partial := range results {
+		stats.Records += partial.Records
+		stats.GrossUAH += partial.GrossUAH
+		stats.CashbackUAH += partial.CashbackUAH
+		stats.NetUAH += partial.NetUAH
+		stats.ChecksumValue += partial.ChecksumValue
 	}
 	select {
 	case err := <-errCh:
@@ -448,6 +515,8 @@ func processTransactionsProducerConsumer(cfg transactionsConfig, workers int) (t
 		return stats, nil
 	}
 }
+
+// --- Shared helpers ---
 
 func openTransactionsReader(path string) (*csv.Reader, *os.File, error) {
 	file, err := os.Open(path)
