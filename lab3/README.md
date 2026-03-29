@@ -12,12 +12,6 @@ Run a task:
 go run . run <bank|ipc> [flags]
 ```
 
-Run benchmark:
-
-```bash
-go run . bench <bank|ipc> [flags]
-```
-
 Demonstrate race condition (use -race flag):
 
 ```bash
